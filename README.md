@@ -22,8 +22,9 @@ The extension communicates with Hanseatic Bank's private JSON REST API at `conne
 |------|--------|
 | 1 | Confirmation dialog shown — no request sent yet (prevents simultaneous OTP triggers on bulk refresh) |
 | 2 | `POST /token` with `grant_type=hbSCACustomPassword`, credentials, and Basic Auth → triggers app push or SMS OTP; response contains a signed JWT with `sca_id` and `sca_type` |
-| 3 | **SMS:** `POST /token` with `otp` and `scaId` → access token. **APP:** `GET /openScaBroker/1.0/customer/{loginId}/status/{scaId}` via client-credentials token to poll confirmation status, then `POST /token` with `devicetoken` from result → access token |
-| 4 | *(First sync only)* `POST /scaBroker/1.0/session` → session SCA for full history; confirmed via app push or SMS OTP |
+| 3a | **SMS:** `POST /token` with `otp` and `scaId` → access token |
+| 3b | **APP:** `GET /openScaBroker/1.0/customer/{loginId}/status/{scaId}` (polled with a client-credentials token) until status is `complete`, then `POST /token` with `devicetoken` from result → access token |
+| 4 | *(First sync only, or until completed)* `POST /scaBroker/1.0/session` → session SCA for full transaction history; confirmed via app push or SMS OTP |
 
 The access token is stored in `LocalStorage` and reused across `ListAccounts` and `RefreshAccount` within the same session. The password is held in `LocalStorage` only for the duration of the login flow and cleared immediately after the token is obtained.
 
@@ -34,7 +35,7 @@ The access token is stored in `LocalStorage` and reused across `ListAccounts` an
 - **Accounts:** `POST /customerinfo/1.0/initCustomer` — returns credit, overnight, and loan accounts
 - **Transactions:** `GET /transaction/1.0/transactionsEnriched/{accountNumber}?page=N&withReservations=true&withEnrichments=true`, paginated (up to 50 pages as a safety limit)
 
-The `moreWithSCA` flag in the transaction response signals that older transactions exist behind an SCA gate. The extension records this and requests a session SCA on the next login — but only once.
+The `moreWithSCA` flag in the transaction response signals that older transactions exist behind an SCA gate. The extension records this in `LocalStorage` and requests a session SCA on the next login. This repeats until the session SCA is successfully completed, after which `historyLoaded` is set permanently and no further session SCA is ever needed.
 
 ## Requirements
 
@@ -42,7 +43,7 @@ The `moreWithSCA` flag in the transaction response signals that older transactio
 - A **Meine Hanseatic Bank** account
 - Your **10-digit Login ID** and **password**
 
-> **Note:** This extension uses the same API as the Hanseatic Bank web portal. Hanseatic Bank App users with app-based SCA enabled will receive a push notification instead of an SMS.
+> **Note:** This extension uses the same API as the Hanseatic Bank web portal. If you have the Hanseatic Bank app installed with push notifications enabled, you will receive an in-app confirmation request. Otherwise, the bank sends an SMS OTP.
 
 ## Installation
 
@@ -69,8 +70,8 @@ cp moneymoney-hanseaticbank/HanseaticGenialcard.lua \
 2. Search for **"Hanseatic Bank"**
 3. Select **Hanseatic Bank**
 4. Enter your **10-digit Login ID** and **password**
-5. Click **Done** — a confirmation request will be sent to your app or via SMS
-6. Confirm in the Hanseatic Bank app (or enter the SMS OTP) and click **Done** again
+5. Click **Done** — the extension will trigger a confirmation request (app push or SMS, depending on your Hanseatic Bank setup)
+6. Confirm in the Hanseatic Bank app, or enter the SMS OTP, then click **Done** again
 
 ## Supported Account Types
 
@@ -83,8 +84,8 @@ cp moneymoney-hanseaticbank/HanseaticGenialcard.lua \
 ## Limitations
 
 - **EUR only** — foreign currency amounts are appended to the transaction note but not mapped as separate currency fields
-- Transaction history beyond the standard page limit requires a one-time session SCA confirmation (first sync only)
-- The tokenised PAN (`tpan`) returned by the API has non-digit characters replaced with `X` — the real card number is not available via the API
+- Full transaction history (beyond the first few pages) requires a session SCA confirmation — this happens automatically on the first sync and is not repeated once completed
+- The API returns a tokenised card number (`tpan`) with the middle digits already masked; non-digit placeholder characters are normalised to `X` (e.g. `415299XXXXXX9866`). The real card number is not accessible via the API
 
 ## Troubleshooting
 
@@ -98,7 +99,11 @@ cp moneymoney-hanseaticbank/HanseaticGenialcard.lua \
 
 **App push not received**
 - Open the Hanseatic Bank app once to ensure push notifications are enabled
-- If no push arrives, the bank may fall back to SMS
+- If no push arrives, the bank falls back to SMS automatically
+
+**Full transaction history not loading**
+- On the first sync, the extension requests a session SCA after the regular login — confirm it in the app or via SMS when prompted
+- If you cancel the session SCA, it will be requested again on the next sync until completed successfully
 
 ## Changelog
 

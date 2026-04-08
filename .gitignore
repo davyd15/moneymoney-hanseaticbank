@@ -1,1 +1,11 @@
 .DS_Store
+
+# Claude Code development artifacts
+.claude/
+CLAUDE.md
+
+# Network traffic recordings (may contain live session cookies)
+*.har
+
+# Internal API documentation
+moneymoney-api.md
