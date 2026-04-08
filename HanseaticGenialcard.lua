@@ -23,6 +23,10 @@ WebBanking{
 -- Constants
 --------------------------------------------------------------------------------
 local API        = "https://connecthb.hanseaticbank.de"
+-- BASIC_AUTH, CL_ID, and CL_SC identify MoneyMoney as an API client to the bank.
+-- These are not user credentials — they are equivalent to an OAuth2 client registration
+-- and were extracted from the bank's web portal. User credentials (loginId, password)
+-- are handled separately via LocalStorage and cleared immediately after token acquisition.
 local BASIC_AUTH = "Basic bTZLVnV4ZVhoY1FYV0RHNWM5VWNDYVo1QnA0YTo0alhIUWRxMGhqdG9ibUNWZW11NlFWcGliX3dh"
 local CL_ID      = "5bnQTsZSz_IixlE0YqX4CrVCjPca"
 local CL_SC      = "cNLo9jjW9kpDkcf3VRnfmRXmXFoa"
@@ -109,6 +113,7 @@ end
 local function ensureConnection()
   if not connection then
     connection = Connection()
+    -- Bank API requires German locale to return correct response structure
     connection.language  = "de-DE,de;q=0.9"
     connection.useragent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                          .. "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -189,6 +194,7 @@ local function getCustomerData(token)
   if customerCache then return customerCache end
   local resp = connection:request(
     "POST", API .. "/customerinfo/1.0/initCustomer",
+    -- "language":"de" is required by the bank API — does not affect returned data structure
     '{"initiator":"MHB","language":"de"}',
     "application/json",
     hdrBearer(token)
@@ -217,6 +223,7 @@ end
 -- Start session SCA for full transaction history.
 -- POST /scaBroker/1.0/session with Bearer token in body.
 local function startSessionSCA(token)
+  -- "lang":"de" is a required API field; does not change response structure
   local body = '{"initiator":"ton-sca-fe","lang":"de","session":"Bearer ' .. token .. '"}'
   local resp = connection:request(
     "POST", API .. "/scaBroker/1.0/session",
@@ -300,7 +307,8 @@ local function loadAllTransactions(token, accountNumber, since)
           purpose = purpose .. (purpose ~= "" and " " or "") .. "(" .. fx .. ")"
         end
 
-        -- Determine transaction type
+        -- Determine transaction type from bank API enum (values are in German)
+        -- GUTSCHRIFT = credit/refund, LS_EINZUG = direct debit, UEBERWEISUNG = transfer
         local cdk    = tx["creditDebitKeyPhraseCompatible"] or ""
         local txType = TransactionTypeOther
         if cdk == "GUTSCHRIFT" or cdk == "LS_EINZUG" then
@@ -329,7 +337,7 @@ local function loadAllTransactions(token, accountNumber, since)
     -- Pagination
     if data["more"] == true then
       page = page + 1
-      if page > 50 then break end  -- safety limit
+      if page > 50 then break end  -- safety limit (~2500+ transactions)
     else
       if data["moreWithSCA"] == true then moreWithSCA = true end
       stop = true
@@ -521,7 +529,7 @@ function InitializeSession2(protocol, bankCode, step, credentials, interactive)
       if status == "open" then
         local t = (LocalStorage.tries or 0) + 1
         LocalStorage.tries = t
-        if t >= 15 then
+        if t >= 15 then  -- max polling attempts reached
           LocalStorage.scaId = nil
           LocalStorage.pw    = nil
           return LoginFailed
@@ -558,7 +566,7 @@ function InitializeSession2(protocol, bankCode, step, credentials, interactive)
 
     if not tok then return LoginFailed end
 
-    -- Save token, clear sensitive data
+    -- Persist access token; clear temporary SCA ID and password from LocalStorage
     accessToken = tok
     LocalStorage.accessToken = tok
     LocalStorage.scaId       = nil
@@ -655,8 +663,7 @@ function InitializeSession2(protocol, bankCode, step, credentials, interactive)
       if status == "open" then
         local t = (LocalStorage.sessionTries or 0) + 1
         LocalStorage.sessionTries = t
-        if t >= 15 then
-          -- Timeout: continue without full history
+        if t >= 15 then  -- max polling attempts reached; continue without full history
           LocalStorage.sessionScaId = nil
           MM.printStatus("Logged in successfully (without full transaction history).")
           return nil
