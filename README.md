@@ -118,6 +118,12 @@ Bug reports and pull requests are welcome. If the bank changes its login flow or
 
 To test changes locally, copy the `.lua` file into the Extensions folder and reload extensions in MoneyMoney.
 
+## Security
+
+The extension contains three static OAuth2 client values (`BASIC_AUTH`, `CL_ID`, `CL_SC`) that identify the Hanseatic Bank web portal as an API client. These are **not user credentials** — they are embedded in the bank's own web application and confer no account access without a valid end-user login. User credentials are stored exclusively in MoneyMoney's encrypted keychain and are never written to disk or transmitted to any third party.
+
+For full details on the credential model, user data handling, and how to report a vulnerability, see [SECURITY.md](SECURITY.md).
+
 ## Disclaimer
 
 This extension is an independent community project and is **not affiliated with, endorsed by, or supported by Hanseatic Bank** or the MoneyMoney developers. Use at your own risk. Credentials are handled solely by MoneyMoney's built-in secure storage and are never transmitted to any third party.
