@@ -1,0 +1,10 @@
+version: 2
+
+ignored-matches:
+  - name: >
+      Hanseatic Bank OAuth2 client credential — public API identifier, not a user secret.
+      This value identifies the Hanseatic Bank web portal as an OAuth2 client to the bank's
+      own authorization server. It is embedded in the bank's web application and is not
+      confidential: it confers no access without a valid end-user login. It is intentionally
+      included in this repository because the extension cannot function without it.
+    match: "bTZLVnV4ZVhoY1FYV0RHNWM5VWNDYVo1QnA0YTo0alhIUWRxMGhqdG9ibUNWZW11NlFWcGliX3dh"

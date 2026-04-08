@@ -23,10 +23,12 @@ WebBanking{
 -- Constants
 --------------------------------------------------------------------------------
 local API        = "https://connecthb.hanseaticbank.de"
--- BASIC_AUTH, CL_ID, and CL_SC identify MoneyMoney as an API client to the bank.
--- These are not user credentials — they are equivalent to an OAuth2 client registration
--- and were extracted from the bank's web portal. User credentials (loginId, password)
--- are handled separately via LocalStorage and cleared immediately after token acquisition.
+-- BASIC_AUTH, CL_ID, and CL_SC are the OAuth2 client credentials of the Hanseatic Bank
+-- web portal. They identify the API client to the bank's authorization server and are
+-- embedded in the bank's own web application — they are not user credentials and confer
+-- no account access on their own. User credentials (loginId, password) are passed through
+-- MoneyMoney's secure keychain, held in LocalStorage only for the duration of the token
+-- request, and cleared immediately afterwards. See SECURITY.md for the full credential model.
 local BASIC_AUTH = "Basic bTZLVnV4ZVhoY1FYV0RHNWM5VWNDYVo1QnA0YTo0alhIUWRxMGhqdG9ibUNWZW11NlFWcGliX3dh"
 local CL_ID      = "5bnQTsZSz_IixlE0YqX4CrVCjPca"
 local CL_SC      = "cNLo9jjW9kpDkcf3VRnfmRXmXFoa"
