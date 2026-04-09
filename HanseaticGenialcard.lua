@@ -1,19 +1,30 @@
 -- ============================================================
 -- MoneyMoney Web Banking Extension
 -- Hanseatic Bank (HB) Germany – Meine Hanseatic Bank
--- Version: 3.71
+-- Version: 3.78
 --
 -- Credentials:
 --   Username: Login ID (10-digit number, e.g. 5101821536)
 --   Password: Your Hanseatic Bank password
 --
--- Changes in 3.71:
---   - Added confirmation dialog before OTP request to prevent
---     simultaneous OTP triggers when refreshing all accounts
+-- Changes in 3.73:
+--   - Steps 2+ now use LocalStorage state instead of step numbers.
+--     MoneyMoney always increments the step on each dialog, so
+--     the previous step-number-based APP polling broke when the
+--     pending dialog caused a step increment before login was done.
+--     State-based dispatch fixes APP polling for both login SCA
+--     and session SCA regardless of how many steps are needed.
+--
+-- Changes in 3.72:
+--   - Step 1 now triggers login and SCA immediately, returning
+--     the OTP input or app confirmation dialog directly.
+--     This keeps the dialog window open for user interaction
+--     and prevents other extensions from interleaving during
+--     bulk refresh (Rundruf).
 -- ============================================================
 
 WebBanking{
-  version     = 3.71,
+  version     = 3.78,
   url         = "https://meine.hanseaticbank.de",
   services    = {"Hanseatic Bank"},
   description = "Hanseatic Bank credit card (App SCA or SMS OTP)"
@@ -358,30 +369,31 @@ function SupportsBank(protocol, bankCode)
 end
 
 --[[
-  Login flow (up to 4 steps):
+  Login flow:
 
-  Step 1: Show confirmation dialog (no HTTP request)
-          -> Prevents simultaneous OTP requests on bulk refresh
+  Step 1: HTTP-Login senden, SCA auslösen (Altzustand wird gelöscht)
+          -> SMS: OTP-Eingabedialog (label gesetzt)
+          -> APP: "In App bestätigen"-Dialog
+          Der HTTP-Call in Step 1 hält das Fenster offen und verhindert,
+          dass andere Extensions beim Rundruf dazwischenkommen.
 
-  Step 2: Request login token + trigger SCA
-          -> SMS: OTP input dialog
-          -> APP: "Confirm in app" dialog
+  Steps 2+: Zustandsbasierte Verarbeitung (LocalStorage):
 
-  Step 3: Complete login + optionally start session SCA
-          -> If needSessionSCA set: start session SCA
-            -> SMS: OTP input dialog for transactions
-            -> APP: "Confirm in app" dialog
-          -> Otherwise: done (single confirmation)
+          Phase A — scaId gesetzt (Login-SCA ausstehend):
+            SMS: OTP aus credentials[1] prüfen
+            APP: SCA-Status abfragen; bei "open" pending-Dialog zurückgeben
+                 (jeder Klick erhöht den Step, Zustand bleibt in LocalStorage)
 
-  Step 4: Complete session SCA (only if started)
-          -> SMS: PUT with OTP
-          -> APP: GET status poll
-          -> Set historyLoaded to "yes"
+          Phase B — sessionScaId gesetzt (Session-SCA ausstehend):
+            SMS: OTP per PUT bestätigen
+            APP: Status abfragen; bei "open" pending-Dialog zurückgeben
 
-  needSessionSCA is set when:
-    - moreWithSCA=true on transaction fetch
-    - AND historyLoaded is not yet "yes"
-  -> Only on first sync with full history
+          Phase C — nichts ausstehend: Anmeldung abgeschlossen, nil zurück
+
+  needSessionSCA wird gesetzt wenn:
+    - moreWithSCA=true beim Transaktionsabruf
+    - UND historyLoaded noch nicht "yes"
+  -> Nur beim ersten Sync mit vollständiger Historie
 ]]
 
 function InitializeSession2(protocol, bankCode, step, credentials, interactive)
@@ -391,28 +403,24 @@ function InitializeSession2(protocol, bankCode, step, credentials, interactive)
   local password = credentials[2]
 
   -- ----------------------------------------------------------------
-  -- STEP 1: Confirmation dialog (no OTP trigger)
+  -- STEP 1: Login-Request senden und SCA auslösen
   -- ----------------------------------------------------------------
+  -- Zugangsdaten werden nur in Step 1 übergeben → sofort speichern.
+  -- HTTP-Call in Step 1: MoneyMoney zeigt sofort das OTP-Eingabefeld
+  -- oder die App-Bestätigung (EIN Fenster, kein Pre-Dialog).
+  -- Altzustand aus früheren Sessions wird vollständig gelöscht.
   if step == 1 then
-    -- Save credentials here — MoneyMoney does not pass them to step 2
+    LocalStorage.scaId          = nil
+    LocalStorage.scaType        = nil
+    LocalStorage.tries          = nil
+    LocalStorage.accessToken    = nil
+    LocalStorage.sessionScaId   = nil
+    LocalStorage.sessionScaType = nil
+    LocalStorage.sessionTries   = nil
     LocalStorage.userId = loginId
     LocalStorage.pw     = password
-    return {
-      title     = "Hanseatic Bank – Login",
-      challenge = "Login requires confirmation via app or SMS.\n\n"
-                .. "Click 'Done' to start the login\n"
-                .. "and trigger the confirmation request.",
-    }
-  end
 
-  -- ----------------------------------------------------------------
-  -- STEP 2: Request login token + trigger SCA
-  -- ----------------------------------------------------------------
-  if step == 2 then
-    -- Read credentials from LocalStorage (saved in step 1)
-    loginId  = LocalStorage.userId or loginId
-    password = LocalStorage.pw     or password
-    MM.printStatus("Sending login request...")
+    MM.printStatus("Anmeldung wird gesendet...")
 
     local resp = connection:request(
       "POST", API .. "/token",
@@ -425,72 +433,75 @@ function InitializeSession2(protocol, bankCode, step, credentials, interactive)
 
     if isError(resp) then
       return {
-        title     = "Login failed",
-        challenge = "Please check your Login ID and password."
+        title     = "Anmeldung fehlgeschlagen",
+        challenge = "Bitte Login-ID und Passwort prüfen."
       }
     end
 
     local data    = tryJSON(resp)
     local idToken = data and data["id_token"]
     if not idToken then
-      return { title="Error", challenge="Unexpected server response." }
+      return { title="Fehler", challenge="Unerwartete Serverantwort." }
     end
 
     local payload = extractJWTPayload(idToken)
     if not payload then
-      return { title="Error", challenge="Could not parse JWT." }
+      return { title="Fehler", challenge="JWT konnte nicht gelesen werden." }
     end
 
     local scaId   = payload["sca_id"]
     local scaType = payload["sca_type"] or "APP"
     if not scaId then
-      return { title="Error", challenge="No SCA ID received." }
+      return { title="Fehler", challenge="Keine SCA-ID erhalten." }
     end
 
-    -- Save login data for step 3
     LocalStorage.scaId   = scaId
     LocalStorage.scaType = scaType
-    LocalStorage.userId  = loginId
-    LocalStorage.pw      = password
     LocalStorage.tries   = 0
 
     if scaType == "SMS" then
       return {
-        title     = "Enter SMS OTP",
-        challenge = "An SMS OTP has been sent to your registered mobile number.\n\n"
-                  .. "Please enter the OTP:",
-        label     = "SMS OTP",
+        title     = "SMS-OTP eingeben",
+        challenge = "Ein SMS-OTP wurde an Ihre hinterlegte Mobilnummer gesendet.\n\n"
+                  .. "Bitte OTP eingeben:",
+        label     = "SMS-OTP",
       }
     else
       return {
-        title     = "App confirmation required",
-        challenge = "A login request has been sent to the Hanseatic Bank app.\n\n"
-                  .. "Please open the app, confirm the login,\n"
-                  .. "and then click 'Done'."
+        title     = "App-Bestätigung erforderlich",
+        challenge = "Eine Anmeldeanforderung wurde an die Hanseatic Bank App gesendet.\n\n"
+                  .. "Bitte die App öffnen, die Anmeldung bestätigen\n"
+                  .. "und dann auf 'Weiter' klicken."
       }
     end
   end
 
   -- ----------------------------------------------------------------
-  -- STEP 3: Complete login + optionally start session SCA
+  -- STEPS 2+: Zustandsbasierte Verarbeitung
+  -- MoneyMoney erhöht die Schrittnummer bei jedem Dialog immer weiter.
+  -- Daher wird der Zustand über LocalStorage verwaltet.
   -- ----------------------------------------------------------------
-  if step == 3 then
+
+  -- ----------------------------------------------------------------
+  -- PHASE A: Login-SCA abschließen (noch kein Access-Token)
+  -- ----------------------------------------------------------------
+  if LocalStorage.scaId then
     local scaId   = LocalStorage.scaId
     local scaType = LocalStorage.scaType or "APP"
     local uid     = LocalStorage.userId
     local pw      = LocalStorage.pw
 
-    if not scaId or not uid or not pw then return LoginFailed end
+    if not uid or not pw then return LoginFailed end
 
     local tok = nil
 
-    -- SMS login: request token with OTP
+    -- SMS: verify OTP submitted by user
     if scaType == "SMS" then
-      MM.printStatus("Verifying SMS OTP...")
+      MM.printStatus("SMS-OTP wird geprüft...")
       local tan = (credentials[1] or ""):match("^%s*(.-)%s*$") or ""
       if tan == "" then
-        return { title="OTP required",
-                 challenge="Please enter the SMS OTP:", label="SMS OTP" }
+        return { title="OTP erforderlich",
+                 challenge="Bitte SMS-OTP eingeben:", label="SMS-OTP" }
       end
 
       local resp = connection:request(
@@ -504,17 +515,17 @@ function InitializeSession2(protocol, bankCode, step, credentials, interactive)
       )
 
       if isError(resp) then
-        return { title="Invalid or expired OTP",
-                 challenge="Please try logging in again." }
+        return { title="OTP ungültig oder abgelaufen",
+                 challenge="Bitte erneut anmelden." }
       end
 
       local d = tryJSON(resp)
       tok = d and d["access_token"]
       if tok then LocalStorage.refreshToken = d["refresh_token"] end
 
-    -- APP login: check SCA status + get final token
+    -- APP: poll SCA status and get final token when complete
     else
-      MM.printStatus("Checking app confirmation...")
+      MM.printStatus("App-Bestätigung wird geprüft...")
 
       local clientToken = getClientToken()
       if not clientToken then return LoginFailed end
@@ -536,10 +547,12 @@ function InitializeSession2(protocol, bankCode, step, credentials, interactive)
           LocalStorage.pw    = nil
           return LoginFailed
         end
+        -- Return pending dialog; MoneyMoney will increment step but
+        -- Phase A will still apply on the next call (scaId still set).
         return {
-          title     = string.format("App confirmation pending (%d/15)", t),
-          challenge = "Please confirm the login in the Hanseatic Bank app\n"
-                    .. "and then click 'Done'."
+          title     = string.format("App-Bestätigung ausstehend (%d/15)", t),
+          challenge = "Bitte die Anmeldung in der Hanseatic Bank App bestätigen.",
+          values    = {"Bestätigung erteilt"},
         }
       end
 
@@ -568,11 +581,12 @@ function InitializeSession2(protocol, bankCode, step, credentials, interactive)
 
     if not tok then return LoginFailed end
 
-    -- Persist access token; clear temporary SCA ID and password from LocalStorage
+    -- Login successful: persist access token, clear login SCA state
     accessToken = tok
     LocalStorage.accessToken = tok
     LocalStorage.scaId       = nil
     LocalStorage.pw          = nil
+    LocalStorage.tries       = nil
 
     -- Preload customer data and cache for ListAccounts
     getCustomerData(tok)
@@ -583,7 +597,7 @@ function InitializeSession2(protocol, bankCode, step, credentials, interactive)
     LocalStorage.needSessionSCA = nil  -- always reset
 
     if doSessionSCA then
-      MM.printStatus("Starting confirmation for full transaction history...")
+      MM.printStatus("Bestätigung für vollständige Umsatzhistorie wird angefordert...")
       local sessionScaId, sessionScaType = startSessionSCA(tok)
 
       if sessionScaId then
@@ -593,73 +607,69 @@ function InitializeSession2(protocol, bankCode, step, credentials, interactive)
 
         if sessionScaType == "SMS" then
           return {
-            title     = "OTP for transaction history",
-            challenge = "An SMS OTP for accessing the full\n"
-                      .. "transaction history has been sent.\n\n"
-                      .. "Please enter the OTP:",
-            label     = "SMS OTP",
+            title     = "SMS-OTP für Umsatzhistorie",
+            challenge = "Ein SMS-OTP für den Zugriff auf die vollständige\n"
+                      .. "Umsatzhistorie wurde gesendet.\n\n"
+                      .. "Bitte OTP eingeben:",
+            label     = "SMS-OTP",
           }
         else
           return {
-            title     = "App confirmation for transactions",
-            challenge = "Please confirm access to the transaction history\n"
-                      .. "in the Hanseatic Bank app\n"
-                      .. "and then click 'Done'."
+            title     = "App-Bestätigung für Umsätze",
+            challenge = "Bitte den Zugriff auf die Umsatzhistorie\n"
+                      .. "in der Hanseatic Bank App bestätigen.",
+            values    = {"Bestätigung erteilt"},
           }
         end
       end
     end
 
-    MM.printStatus("Logged in successfully.")
+    MM.printStatus("Erfolgreich angemeldet.")
     return nil
   end
 
   -- ----------------------------------------------------------------
-  -- STEP 4: Complete session SCA
+  -- PHASE B: Complete session SCA (login done, session SCA pending)
   -- ----------------------------------------------------------------
-  if step == 4 then
+  if LocalStorage.sessionScaId then
     local tok            = LocalStorage.accessToken
     local sessionScaId   = LocalStorage.sessionScaId
     local sessionScaType = LocalStorage.sessionScaType or "APP"
 
-    if not tok or not sessionScaId then
-      MM.printStatus("Logged in successfully.")
-      return nil
-    end
+    if not tok then return LoginFailed end
 
     accessToken = tok
 
     -- SMS: confirm with OTP via PUT
     if sessionScaType == "SMS" then
-      MM.printStatus("Confirming OTP for transaction history...")
+      MM.printStatus("OTP für Umsatzhistorie wird geprüft...")
       local tan = (credentials[1] or ""):match("^%s*(.-)%s*$") or ""
 
       if tan == "" then
-        return { title="OTP required",
-                 challenge="Please enter the SMS OTP for\ntransaction history:",
-                 label="SMS OTP" }
+        return { title="OTP erforderlich",
+                 challenge="Bitte SMS-OTP für die Umsatzhistorie eingeben:",
+                 label="SMS-OTP" }
       end
 
       local success = confirmSessionSCAWithOTP(sessionScaId, tan, tok)
 
       if not success then
-        -- Check status once more
         local status = checkSessionSCA(sessionScaId, tok)
         if status ~= "complete" then
           local t = (LocalStorage.sessionTries or 0) + 1
           LocalStorage.sessionTries = t
           if t < 3 then
-            return { title="Invalid OTP",
-                     challenge="Please try again.\nEnter OTP:",
-                     label="SMS OTP" }
+            return { title="OTP ungültig",
+                     challenge="Bitte erneut versuchen.\nOTP eingeben:",
+                     label="SMS-OTP" }
           end
-          -- After 3 failed attempts: continue without full history
+          -- Nach 3 Fehlversuchen: ohne vollständige Historie fortfahren
         end
       end
 
     -- APP: poll status
     else
-      MM.printStatus("Checking app confirmation for transactions...")
+      MM.printStatus("App-Bestätigung für Umsätze wird geprüft...")
       local status = checkSessionSCA(sessionScaId, tok)
 
       if status == "open" then
@@ -667,30 +677,34 @@ function InitializeSession2(protocol, bankCode, step, credentials, interactive)
         LocalStorage.sessionTries = t
         if t >= 15 then  -- max polling attempts reached; continue without full history
           LocalStorage.sessionScaId = nil
-          MM.printStatus("Logged in successfully (without full transaction history).")
+          MM.printStatus("Erfolgreich angemeldet (ohne vollständige Umsatzhistorie).")
           return nil
         end
+        -- Return pending dialog; Phase B still applies on next call (sessionScaId set).
         return {
-          title     = string.format("App confirmation pending (%d/15)", t),
-          challenge = "Please confirm access to the transactions\n"
-                    .. "in the Hanseatic Bank app\n"
-                    .. "and then click 'Done'."
+          title     = string.format("App-Bestätigung ausstehend (%d/15)", t),
+          challenge = "Bitte den Zugriff auf die Umsätze\n"
+                    .. "in der Hanseatic Bank App bestätigen.",
+          values    = {"Bestätigung erteilt"},
         }
       end
     end
 
-    -- Session SCA completed successfully.
-    -- historyLoaded marks that full history was loaded
-    -- -> future syncs require only a single confirmation
+    -- Session SCA erfolgreich abgeschlossen.
+    -- historyLoaded markiert, dass die vollständige Historie geladen wurde
+    -- -> zukünftige Syncs benötigen nur eine einzige Bestätigung
     LocalStorage.historyLoaded  = "yes"
     LocalStorage.sessionScaId   = nil
     LocalStorage.sessionScaType = nil
     LocalStorage.sessionTries   = nil
 
-    MM.printStatus("Logged in successfully.")
+    MM.printStatus("Erfolgreich angemeldet.")
     return nil
   end
 
+  -- ----------------------------------------------------------------
+  -- PHASE C: Nothing pending (should not normally be reached)
+  -- ----------------------------------------------------------------
   return LoginFailed
 end
 
