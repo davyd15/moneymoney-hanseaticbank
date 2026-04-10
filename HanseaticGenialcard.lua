@@ -406,9 +406,7 @@ end
 
 -- Try to authenticate using the stored device token (no SCA push triggered).
 -- Updates LocalStorage on success; clears the device token on failure.
--- Returns nil immediately when the feature is disabled by the user.
 local function tryDeviceToken(loginId, password)
-  if LocalStorage.deviceTokenEnabled ~= "yes" then return nil end
   if not LocalStorage.deviceToken then return nil end
   local resp = connection:request(
     "POST", API .. "/token",
@@ -449,19 +447,14 @@ end
 
   Steps 2+: Zustandsbasierte Verarbeitung (LocalStorage):
 
-          Phase D — deviceTokenAsk gesetzt (einmalige Einstellungsabfrage):
-            Gerät-merken-Dialog auswerten und Einstellung speichern.
-
           Phase A — scaId gesetzt (Login-SCA ausstehend):
             SMS: OTP aus credentials[1] prüfen
             APP: SCA-Status abfragen; bei "open" pending-Dialog zurückgeben
                  (jeder Klick erhöht den Step, Zustand bleibt in LocalStorage)
-            Nach Erfolg: einmalig Einstellungsdialog für Device-Token anzeigen.
 
           Phase B — sessionScaId gesetzt (Session-SCA ausstehend):
             SMS: OTP per PUT bestätigen
             APP: Status abfragen; bei "open" pending-Dialog zurückgeben
-            Nach Erfolg: einmalig Einstellungsdialog für Device-Token anzeigen.
 
           Phase C — nichts ausstehend: Anmeldung abgeschlossen, nil zurück
 
@@ -512,8 +505,8 @@ function InitializeSession2(protocol, bankCode, step, credentials, interactive)
       end
     end
 
-    -- Fast path 3: re-auth with stored device token (no SCA push needed)
-    if LocalStorage.deviceTokenEnabled == "yes" and LocalStorage.deviceToken then
+        -- Fast path 3: re-auth with stored device token (no SCA push needed)
+    if LocalStorage.deviceToken then
       MM.printStatus("Melde mit gespeichertem Gerät an...")
       local tok = tryDeviceToken(loginId, password)
       if tok then
@@ -603,27 +596,6 @@ function InitializeSession2(protocol, bankCode, step, credentials, interactive)
   -- MoneyMoney erhöht die Schrittnummer bei jedem Dialog immer weiter.
   -- Daher wird der Zustand über LocalStorage verwaltet.
   -- ----------------------------------------------------------------
-
-  -- ----------------------------------------------------------------
-  -- PHASE D: Save device token preference (one-time, after first SCA)
-  -- ----------------------------------------------------------------
-  if LocalStorage.deviceTokenAsk == "yes" then
-    LocalStorage.deviceTokenAsk = nil
-    local choice = (credentials[1] or ""):lower()
-    if choice:find("ja") then
-      LocalStorage.deviceTokenEnabled = "yes"
-      -- Commit device token that was held pending the user's choice
-      if LocalStorage.deviceTokenPending then
-        LocalStorage.deviceToken        = LocalStorage.deviceTokenPending
-        LocalStorage.deviceTokenPending = nil
-      end
-    else
-      LocalStorage.deviceTokenEnabled = "no"
-      LocalStorage.deviceTokenPending = nil
-    end
-    MM.printStatus("Einstellung gespeichert.")
-    return nil
-  end
 
   -- ----------------------------------------------------------------
   -- PHASE A: Login-SCA abschließen (noch kein Access-Token)
@@ -721,15 +693,9 @@ function InitializeSession2(protocol, bankCode, step, credentials, interactive)
       tok = d and d["access_token"]
       if tok then
         LocalStorage.refreshToken = d["refresh_token"]
+        -- Persist device token so subsequent syncs can skip SCA entirely
         if deviceToken ~= "" then
-          if LocalStorage.deviceTokenEnabled == "yes" then
-            -- Feature already enabled: commit immediately
-            LocalStorage.deviceToken = deviceToken
-          elseif LocalStorage.deviceTokenEnabled == nil then
-            -- First-time setup: hold until user confirms in the wizard
-            LocalStorage.deviceTokenPending = deviceToken
-          end
-          -- "no": discard silently
+          LocalStorage.deviceToken = deviceToken
         end
       end
     end
@@ -745,12 +711,6 @@ function InitializeSession2(protocol, bankCode, step, credentials, interactive)
 
     -- Preload customer data and cache for ListAccounts
     getCustomerData(tok)
-
-    -- First-time setup: mark device token wizard as pending.
-    -- Only triggered on a fresh account (historyLoaded not yet set) and only once.
-    if LocalStorage.historyLoaded ~= "yes" and LocalStorage.deviceTokenEnabled == nil then
-      LocalStorage.deviceTokenSetupPending = "yes"
-    end
 
     -- Only start session SCA if moreWithSCA=true on last refresh
     -- AND full history has never been successfully loaded
@@ -791,9 +751,9 @@ function InitializeSession2(protocol, bankCode, step, credentials, interactive)
       LocalStorage.deviceTokenAsk = "yes"
       return {
         title     = "Gerät merken aktivieren?",
-        challenge = "Der Device-Token ermöglicht die automatische Anmeldung\n"
-                  .. "ohne SCA-Bestätigung bei zukünftigen Syncs.\n\n"
-                  .. "Standardmäßig deaktiviert. Aktivieren empfohlen.",
+        challenge = "Möchtest du diesem Gerät vertrauen und in Zukunft\n"
+                  .. "ohne Zweifaktor Authentifizierung synchronisieren?\n\n"
+                  .. "( Diese Einstellung speichert das Gerätetoken auf diesem Computer \n\n)",
         values    = {"Nein, immer bestätigen", "Ja, Gerät merken"},
       }
     end
@@ -871,19 +831,6 @@ function InitializeSession2(protocol, bankCode, step, credentials, interactive)
     LocalStorage.sessionScaId   = nil
     LocalStorage.sessionScaType = nil
     LocalStorage.sessionTries   = nil
-
-    -- Show device token setup wizard on first-time setup (deferred from above)
-    if LocalStorage.deviceTokenSetupPending == "yes" then
-      LocalStorage.deviceTokenSetupPending = nil
-      LocalStorage.deviceTokenAsk = "yes"
-      return {
-        title     = "Gerät merken aktivieren?",
-        challenge = "Der Device-Token ermöglicht die automatische Anmeldung\n"
-                  .. "ohne SCA-Bestätigung bei zukünftigen Syncs.\n\n"
-                  .. "Standardmäßig deaktiviert. Aktivieren empfohlen.",
-        values    = {"Nein, immer bestätigen", "Ja, Gerät merken"},
-      }
-    end
 
     MM.printStatus("Erfolgreich angemeldet.")
     return nil
@@ -1020,9 +967,6 @@ function EndSession()
   LocalStorage.sessionScaId   = nil
   LocalStorage.sessionScaType = nil
   LocalStorage.sessionTries   = nil
-  LocalStorage.needSessionSCA          = nil
-  LocalStorage.deviceTokenAsk          = nil
-  LocalStorage.deviceTokenSetupPending = nil
-  LocalStorage.deviceTokenPending      = nil
+  LocalStorage.needSessionSCA = nil
   return nil
 end
