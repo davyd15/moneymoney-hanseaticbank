@@ -1,11 +1,27 @@
 -- ============================================================
 -- MoneyMoney Web Banking Extension
 -- Hanseatic Bank (HB) Germany – Meine Hanseatic Bank
--- Version: 3.78
+-- Version: 3.81
 --
 -- Credentials:
 --   Username: Login ID (10-digit number, e.g. 5101821536)
 --   Password: Your Hanseatic Bank password
+--
+-- Changes in 3.81:
+--   - needSessionSCA no longer cleared in EndSession — persists until
+--     the next interactive sync picks it up (was lost between sessions).
+--   - Session SCA in fast path only triggers when interactive=true.
+--
+-- Changes in 3.80:
+--   - Fast path now also triggers session SCA when needed (full history).
+--     Phase B handles subsequent steps as before.
+--
+-- Changes in 3.79:
+--   - Device token fast path: store DEVICETOKEN after SCA and reuse
+--     it on subsequent syncs to skip the SCA push entirely.
+--     Fallback to full SCA if the token is invalidated by the bank.
+--   - Non-interactive guard: no SCA push during background/auto syncs.
+--   - Removed unused refresh token handling.
 --
 -- Changes in 3.73:
 --   - Steps 2+ now use LocalStorage state instead of step numbers.
@@ -24,7 +40,7 @@
 -- ============================================================
 
 WebBanking{
-  version     = 3.78,
+  version     = 3.81,
   url         = "https://meine.hanseaticbank.de",
   services    = {"Hanseatic Bank"},
   description = "Hanseatic Bank credit card (App SCA or SMS OTP)"
@@ -420,6 +436,78 @@ function InitializeSession2(protocol, bankCode, step, credentials, interactive)
     LocalStorage.userId = loginId
     LocalStorage.pw     = password
 
+    -- Fast path: try stored device token (skips SCA push entirely).
+    -- Device token + credentials → bank recognises the device and returns
+    -- an access token directly without triggering an app push or SMS OTP.
+    local storedToken = LocalStorage.deviceToken
+    if storedToken then
+      MM.printStatus("Anmeldung mit gespeichertem Geräteschlüssel...")
+      local resp = connection:request(
+        "POST", API .. "/token",
+        "grant_type=hbSCACustomPassword"
+        .. "&password=" .. ue(password)
+        .. "&loginId="  .. ue(loginId),
+        "application/x-www-form-urlencoded; charset=UTF-8",
+        hdrBasic({["devicetoken"] = storedToken})
+      )
+      if not isError(resp) then
+        local d   = tryJSON(resp)
+        local tok = d and d["access_token"]
+        if tok then
+          accessToken = tok
+          LocalStorage.accessToken = tok
+          LocalStorage.pw          = nil
+          getCustomerData(tok)
+
+          -- Check if session SCA is needed for full transaction history.
+          -- Only trigger in interactive mode; leave the flag set otherwise
+          -- so the next interactive sync can pick it up.
+          -- Same logic as Phase A — Phase B handles subsequent steps.
+          local doSessionSCA = interactive and LocalStorage.needSessionSCA == "yes"
+          if doSessionSCA then LocalStorage.needSessionSCA = nil end
+
+          if doSessionSCA then
+            MM.printStatus("Bestätigung für vollständige Umsatzhistorie wird angefordert...")
+            local sessionScaId, sessionScaType = startSessionSCA(tok)
+
+            if sessionScaId then
+              LocalStorage.sessionScaId   = sessionScaId
+              LocalStorage.sessionScaType = sessionScaType or "APP"
+              LocalStorage.sessionTries   = 0
+
+              if sessionScaType == "SMS" then
+                return {
+                  title     = "SMS-OTP für Umsatzhistorie",
+                  challenge = "Ein SMS-OTP für den Zugriff auf die vollständige\n"
+                            .. "Umsatzhistorie wurde gesendet.\n\n"
+                            .. "Bitte OTP eingeben:",
+                  label     = "SMS-OTP",
+                }
+              else
+                return {
+                  title     = "App-Bestätigung für Umsätze",
+                  challenge = "Bitte den Zugriff auf die Umsatzhistorie\n"
+                            .. "in der Hanseatic Bank App bestätigen.",
+                  values    = {"Bestätigung erteilt"},
+                }
+              end
+            end
+          end
+
+          MM.printStatus("Erfolgreich angemeldet.")
+          return nil
+        end
+      end
+      -- Token rejected by bank (e.g. after password change) → full SCA.
+      MM.printStatus("Geräteschlüssel ungültig — vollständige SCA erforderlich...")
+      LocalStorage.deviceToken = nil
+    end
+
+    -- Non-interactive guard: do not trigger SCA push during background syncs.
+    if not interactive then
+      return LoginFailed
+    end
+
     MM.printStatus("Anmeldung wird gesendet...")
 
     local resp = connection:request(
@@ -521,7 +609,6 @@ function InitializeSession2(protocol, bankCode, step, credentials, interactive)
 
       local d = tryJSON(resp)
       tok = d and d["access_token"]
-      if tok then LocalStorage.refreshToken = d["refresh_token"] end
 
     -- APP: poll SCA status and get final token when complete
     else
@@ -561,7 +648,10 @@ function InitializeSession2(protocol, bankCode, step, credentials, interactive)
       local rd          = sca["resultData"] or {}
       local deviceToken = rd["DEVICETOKEN"] or ""
       local fExtra      = {}
-      if deviceToken ~= "" then fExtra["devicetoken"] = deviceToken end
+      if deviceToken ~= "" then
+        fExtra["devicetoken"]    = deviceToken
+        LocalStorage.deviceToken = deviceToken  -- persist for future syncs
+      end
 
       local fResp = connection:request(
         "POST", API .. "/token",
@@ -576,7 +666,6 @@ function InitializeSession2(protocol, bankCode, step, credentials, interactive)
 
       local d = tryJSON(fResp)
       tok = d and d["access_token"]
-      if tok then LocalStorage.refreshToken = d["refresh_token"] end
     end
 
     if not tok then return LoginFailed end
@@ -821,7 +910,6 @@ function EndSession()
   accessToken   = nil
   customerCache = nil
   LocalStorage.accessToken    = nil
-  LocalStorage.refreshToken   = nil
   LocalStorage.scaId          = nil
   LocalStorage.scaType        = nil
   LocalStorage.userId         = nil
@@ -830,8 +918,9 @@ function EndSession()
   LocalStorage.sessionScaId   = nil
   LocalStorage.sessionScaType = nil
   LocalStorage.sessionTries   = nil
-  LocalStorage.needSessionSCA = nil
-  -- Intentionally NOT clearing historyLoaded.
-  -- It persists permanently so future syncs need no second confirmation.
+  -- Intentionally NOT clearing historyLoaded, deviceToken, or needSessionSCA.
+  -- historyLoaded:  future syncs need no session SCA confirmation.
+  -- deviceToken:    future syncs can skip the SCA push entirely.
+  -- needSessionSCA: persists until the next interactive sync picks it up.
   return nil
 end
