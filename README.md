@@ -9,8 +9,7 @@ A [MoneyMoney](https://moneymoney-app.com) extension for **Hanseatic Bank (HB) G
 - Supports **credit card, overnight money, and loan** accounts in EUR
 - Fetches paginated transaction history including reservations and enriched merchant data
 - Appends city and foreign currency amount to transaction details
-- **Three-tier fast-path authentication** — avoids SCA on every sync when tokens are still valid
-- **Optional device token** — re-authenticates silently without an app push (opt-in, disabled by default)
+- **Device token fast path** — re-authenticates with stored credentials and device token; SCA push skipped on every subsequent sync
 - Non-interactive guard — never triggers an unexpected push notification during background/scheduled syncs
 - Full transaction history (beyond the standard page limit) via optional session SCA — only required on the first sync
 
@@ -20,15 +19,16 @@ The extension communicates with Hanseatic Bank's private JSON REST API at `conne
 
 ### Authentication
 
-On every sync the extension tries three fast paths before falling back to a full SCA:
+On every sync the extension tries the device token fast path before falling back to a full SCA:
 
-| Fast path | Condition | Action |
-|-----------|-----------|--------|
-| 1 | Stored access token is still valid (JWT `exp` not yet reached) | Reuse it directly — no network call |
-| 2 | Access token expired, refresh token stored | `POST /token` with `grant_type=refresh_token` → new access token, no SCA push |
-| 3 | Refresh token missing/expired, device token stored and **enabled** | `POST /token` with `grant_type=hbSCACustomPassword` + `devicetoken` header → new access token, no SCA push |
+| Condition | Action |
+|-----------|--------|
+| Device token stored | `POST /token` with `grant_type=hbSCACustomPassword`, credentials, and `devicetoken` header → access token, no SCA push |
+| No device token (first sync, or token invalidated) | Full SCA login (see below) |
 
-If all three fail, a full SCA login is performed:
+Credentials are re-submitted on every sync; only the SCA push is skipped.
+
+If the device token fast path is unavailable or fails, a full SCA login is performed:
 
 | Step | Action |
 |------|--------|
@@ -37,18 +37,13 @@ If all three fail, a full SCA login is performed:
 | 2b | **APP:** `GET /openScaBroker/1.0/customer/{loginId}/status/{scaId}` (polled with a client-credentials token, up to 15 attempts) until status is `complete`, then `POST /token` with `devicetoken` from result → access token |
 | 3 | *(First sync only)* `POST /scaBroker/1.0/session` → session SCA for full transaction history; confirmed via app push or SMS OTP |
 
-The access token, refresh token, and device token are stored in `LocalStorage` and reused across syncs. The password is held in `LocalStorage` only for the duration of the login flow and cleared immediately after the token is obtained.
+The device token is stored in `LocalStorage` and reused across syncs. The access token and refresh token are not persisted — a fresh token is obtained on every sync using the device token. The password is held in `LocalStorage` only for the duration of the login flow and cleared immediately after the token is obtained.
 
-### Device Token Setting
+### Device Token
 
-On **first-time account setup**, after the initial SCA a one-time dialog asks whether to enable the device token feature:
+After the first successful app SCA the device token returned by the bank is stored in `LocalStorage`. On subsequent syncs the extension re-authenticates with your credentials and this token — the bank recognises the device and skips the SCA push.
 
-- **Nein, immer bestätigen** (default) — device token is never stored; every sync uses fast path 1 or 2 only
-- **Ja, Gerät merken** — device token is stored after each successful app SCA and used for fast path 3 on subsequent syncs
-
-> **Existing installations** (accounts added before v3.79) default to disabled. To enable the device token, remove the account from MoneyMoney and re-add it to trigger the setup wizard.
-
-The setting is stored as `deviceTokenEnabled` in `LocalStorage`. To reset it, remove and re-add the account in MoneyMoney.
+If the bank invalidates the device token (e.g. after a password change or security reset), the extension automatically falls back to a full SCA and stores a new device token after confirmation.
 
 ### Session SCA for Full History
 
@@ -96,7 +91,6 @@ cp moneymoney-hanseaticbank/HanseaticGenialcard.lua \
 4. Enter your **10-digit Login ID** and **password**
 5. Click **Done** — the extension will trigger a confirmation request (app push or SMS, depending on your Hanseatic Bank setup)
 6. Confirm in the Hanseatic Bank app, or enter the SMS OTP, then click **Done** again
-7. *(First setup only)* Choose whether to enable the device token for automatic re-authentication
 
 ## Supported Account Types
 
@@ -131,7 +125,7 @@ cp moneymoney-hanseaticbank/HanseaticGenialcard.lua \
 - This can happen when the bank's backend detects repeated SCA requests from an unrecognised device (e.g. after using the extension without a persistent device token). To restore app-based 2FA, log into the Hanseatic Bank web portal, navigate to security settings, and re-register the Hanseatic Secure App as the preferred SCA device
 - Enabling the device token (see above) prevents this from recurring
 
-**SCA required on every sync despite device token being enabled**
+**SCA required on every sync**
 - The device token may have been invalidated by the bank (e.g. after a password change or security reset). The extension will automatically fall back to a full SCA and store a new device token after the next successful confirmation
 
 **Full transaction history not loading**
@@ -142,7 +136,7 @@ cp moneymoney-hanseaticbank/HanseaticGenialcard.lua \
 
 | Version | Changes |
 |---------|---------|
-| 3.79 | Three-tier fast-path authentication (JWT validity check, refresh token, device token); device token opt-in setting shown in first-time setup wizard; non-interactive guard against background SCA pushes |
+| 3.79 | Device token fast path — re-authenticates with stored credentials and device token, skipping SCA push on every subsequent sync; non-interactive guard against background SCA pushes |
 | 3.78 | State-based SCA with German UI |
 | 3.73 | State-based dispatch replaces step-number-based polling — fixes APP polling when pending dialog caused step increment before login completed |
 | 3.72 | HTTP login sent in step 1 to keep dialog open and prevent extension interleaving during bulk refresh |

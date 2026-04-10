@@ -8,13 +8,12 @@
 --   Password: Your Hanseatic Bank password
 --
 -- Changes in 3.79:
---   - Add three-tier fast-path authentication to avoid SCA on every sync:
---       Fast path 1: reuse stored access token if JWT not yet expired
---       Fast path 2: silently refresh via stored refresh token
---       Fast path 3: re-authenticate using stored device token (no push)
---     Only when all three fail is a full SCA push triggered.
---   - Persist DEVICETOKEN, access token, and refresh token in LocalStorage
---     across sessions (previously wiped in EndSession).
+--   - Add device token fast path to avoid SCA on every sync:
+--       Re-authenticates using stored credentials + device token (no push).
+--     Only when no device token is stored (or it has been invalidated)
+--     is a full SCA push triggered.
+--   - Persist DEVICETOKEN in LocalStorage across sessions; credentials are
+--     re-submitted on every sync so only the SCA push is skipped.
 --   - Refuse full SCA in non-interactive (background) mode to prevent
 --     unexpected push notifications during scheduled/automatic syncs.
 --
@@ -372,40 +371,12 @@ local function loadAllTransactions(token, accountNumber, since)
 end
 
 --------------------------------------------------------------------------------
--- Token fast-path helpers
+-- Device token fast path
 --------------------------------------------------------------------------------
 
--- True if the stored JWT access token is still valid (with 60-second safety margin)
-local function jwtValid(token)
-  if not token then return false end
-  local payload = extractJWTPayload(token)
-  local exp = payload and payload["exp"]
-  return exp == nil or MM.time() < (exp - 60)
-end
-
--- Try to exchange the stored refresh token for a new access token silently.
--- Updates LocalStorage on success; clears the refresh token on failure.
-local function tryRefresh()
-  if not LocalStorage.refreshToken then return nil end
-  local resp = connection:request(
-    "POST", API .. "/token",
-    "grant_type=refresh_token"
-    .. "&refresh_token=" .. ue(LocalStorage.refreshToken),
-    "application/x-www-form-urlencoded; charset=UTF-8",
-    hdrBasic()
-  )
-  local data = tryJSON(resp)
-  if not data or not data["access_token"] then
-    LocalStorage.refreshToken = nil
-    return nil
-  end
-  LocalStorage.accessToken  = data["access_token"]
-  LocalStorage.refreshToken = data["refresh_token"] or LocalStorage.refreshToken
-  return data["access_token"]
-end
-
--- Try to authenticate using the stored device token (no SCA push triggered).
--- Updates LocalStorage on success; clears the device token on failure.
+-- Re-authenticate using stored credentials and device token (no SCA push).
+-- Credentials are submitted on every call; only the push is skipped.
+-- Clears the stored device token on failure (invalidated by the bank).
 local function tryDeviceToken(loginId, password)
   if not LocalStorage.deviceToken then return nil end
   local resp = connection:request(
@@ -421,8 +392,7 @@ local function tryDeviceToken(loginId, password)
     LocalStorage.deviceToken = nil
     return nil
   end
-  LocalStorage.accessToken  = data["access_token"]
-  LocalStorage.refreshToken = data["refresh_token"] or LocalStorage.refreshToken
+  LocalStorage.accessToken = data["access_token"]
   return data["access_token"]
 end
 
@@ -437,11 +407,10 @@ end
 --[[
   Login flow:
 
-  Step 1: Fast paths (kein SCA nötig wenn Token noch gültig):
-            1. Gültiger Access-Token (JWT noch nicht abgelaufen)
-            2. Refresh-Token → Access-Token erneuern (kein SCA-Push)
-            3. Device-Token → Access-Token erneuern (kein SCA-Push, wenn aktiviert)
-          Falls alle scheitern: HTTP-Login senden und SCA auslösen.
+  Step 1: Geräte-Token-Pfad (kein SCA wenn Geräte-Token vorhanden):
+            Falls ein Geräte-Token gespeichert ist: Anmeldung mit Zugangsdaten
+            + Geräte-Token → kein SCA-Push.
+          Falls nicht vorhanden oder fehlgeschlagen: HTTP-Login und SCA auslösen.
             -> SMS: OTP-Eingabedialog
             -> APP: "In App bestätigen"-Dialog
 
@@ -479,33 +448,9 @@ function InitializeSession2(protocol, bankCode, step, credentials, interactive)
   -- Altzustand aus früheren Sessions wird vollständig gelöscht.
   if step == 1 then
     -- ----------------------------------------------------------------
-    -- Fast paths: re-authenticate without SCA when possible.
-    -- Checked in order: valid token → refresh token → device token.
+    -- Device token fast path: re-authenticate without SCA push.
+    -- Credentials are submitted every time; only the push is skipped.
     -- ----------------------------------------------------------------
-
-    -- Fast path 1: still-valid access token (JWT not yet expired)
-    if jwtValid(LocalStorage.accessToken) then
-      MM.printStatus("Gültiges Token vorhanden.")
-      accessToken = LocalStorage.accessToken
-      getCustomerData(accessToken)
-      MM.printStatus("Erfolgreich angemeldet.")
-      return nil
-    end
-
-    -- Fast path 2: silent token refresh via stored refresh token
-    if LocalStorage.refreshToken then
-      MM.printStatus("Aktualisiere Access Token...")
-      local tok = tryRefresh()
-      if tok then
-        MM.printStatus("Token aktualisiert.")
-        accessToken = tok
-        getCustomerData(accessToken)
-        MM.printStatus("Erfolgreich angemeldet.")
-        return nil
-      end
-    end
-
-        -- Fast path 3: re-auth with stored device token (no SCA push needed)
     if LocalStorage.deviceToken then
       MM.printStatus("Melde mit gespeichertem Gerät an...")
       local tok = tryDeviceToken(loginId, password)
@@ -636,7 +581,6 @@ function InitializeSession2(protocol, bankCode, step, credentials, interactive)
 
       local d = tryJSON(resp)
       tok = d and d["access_token"]
-      if tok then LocalStorage.refreshToken = d["refresh_token"] end
 
     -- APP: poll SCA status and get final token when complete
     else
@@ -691,12 +635,10 @@ function InitializeSession2(protocol, bankCode, step, credentials, interactive)
 
       local d = tryJSON(fResp)
       tok = d and d["access_token"]
-      if tok then
-        LocalStorage.refreshToken = d["refresh_token"]
-        -- Persist device token so subsequent syncs can skip SCA entirely
-        if deviceToken ~= "" then
-          LocalStorage.deviceToken = deviceToken
-        end
+      -- Persist device token so subsequent syncs can skip SCA entirely.
+      -- Only stored when a password was provided (required to use the token).
+      if tok and deviceToken ~= "" and (pw or "") ~= "" then
+        LocalStorage.deviceToken = deviceToken
       end
     end
 
@@ -743,19 +685,6 @@ function InitializeSession2(protocol, bankCode, step, credentials, interactive)
           }
         end
       end
-    end
-
-    -- Show device token setup wizard on first-time setup (deferred from above)
-    if LocalStorage.deviceTokenSetupPending == "yes" then
-      LocalStorage.deviceTokenSetupPending = nil
-      LocalStorage.deviceTokenAsk = "yes"
-      return {
-        title     = "Gerät merken aktivieren?",
-        challenge = "Möchtest du diesem Gerät vertrauen und in Zukunft\n"
-                  .. "ohne Zweifaktor Authentifizierung synchronisieren?\n\n"
-                  .. "( Diese Einstellung speichert das Gerätetoken auf diesem Computer \n\n)",
-        values    = {"Nein, immer bestätigen", "Ja, Gerät merken"},
-      }
     end
 
     MM.printStatus("Erfolgreich angemeldet.")
@@ -954,11 +883,7 @@ end
 function EndSession()
   accessToken   = nil
   customerCache = nil
-  -- Intentionally kept in LocalStorage across sessions:
-  --   accessToken   – reused if JWT not yet expired (fast path 1)
-  --   refreshToken  – used to silently renew the access token (fast path 2)
-  --   deviceToken   – used to re-auth without an SCA push (fast path 3)
-  --   historyLoaded – prevents repeated session-SCA for full transaction history
+  -- Transient login state — cleared every session:
   LocalStorage.scaId          = nil
   LocalStorage.scaType        = nil
   LocalStorage.userId         = nil
@@ -968,5 +893,10 @@ function EndSession()
   LocalStorage.sessionScaType = nil
   LocalStorage.sessionTries   = nil
   LocalStorage.needSessionSCA = nil
+  LocalStorage.accessToken    = nil
+  LocalStorage.refreshToken   = nil  -- not persisted; cleared for cleanliness
+  -- Intentionally kept in LocalStorage across sessions:
+  --   deviceToken   – used to re-auth without an SCA push (device trust)
+  --   historyLoaded – prevents repeated session-SCA for full transaction history
   return nil
 end

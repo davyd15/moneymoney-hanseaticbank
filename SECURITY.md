@@ -28,11 +28,12 @@ keychain — are required for every authenticated request.
   never written to disk by this extension.
 - During the authentication flow the password is held in `LocalStorage` only for
   the duration of the token request and is cleared immediately afterwards.
-- The **access token**, **refresh token**, and (when the device token feature is
-  enabled) **device token** are persisted in MoneyMoney's sandboxed `LocalStorage`
-  between sessions. This allows the extension to re-authenticate silently on
-  subsequent syncs without prompting for SCA. These values are scoped to
-  MoneyMoney's extension sandbox and are not accessible to other applications.
+- The **device token** is persisted in MoneyMoney's sandboxed `LocalStorage`
+  between sessions. On each subsequent sync the extension re-authenticates using
+  the user's stored credentials together with the device token; the bank
+  recognises the device and skips the SCA push. The access token and refresh
+  token are not persisted across sessions. All `LocalStorage` values are scoped
+  to MoneyMoney's extension sandbox and are not accessible to other applications.
 - No user data is transmitted to any server other than `connecthb.hanseaticbank.de`
   (Hanseatic Bank's own API) and `meine.hanseaticbank.de`.
 
