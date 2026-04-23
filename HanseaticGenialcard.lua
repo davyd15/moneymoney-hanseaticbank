@@ -1,11 +1,20 @@
 -- ============================================================
 -- MoneyMoney Web Banking Extension
 -- Hanseatic Bank (HB) Germany – Meine Hanseatic Bank
--- Version: 3.81
+-- Version: 3.82
 --
 -- Credentials:
 --   Username: Login ID (10-digit number, e.g. 5101821536)
 --   Password: Your Hanseatic Bank password
+--
+-- Changes in 3.82:
+--   - Non-interactive guard moved before fast path: prevents spurious SCA
+--     push during background syncs (fast path POST always triggers a push).
+--   - Fast path now handles id_token response: bank requires SCA even with
+--     deviceToken. Reuse the SCA from the fast path POST instead of sending
+--     a second login POST (was causing two pushes per sync).
+--   - deviceToken no longer cleared when bank returns id_token (it is valid;
+--     was being deleted on every sync, so it never persisted).
 --
 -- Changes in 3.81:
 --   - needSessionSCA no longer cleared in EndSession — persists until
@@ -40,7 +49,7 @@
 -- ============================================================
 
 WebBanking{
-  version     = 3.81,
+  version     = 3.82,
   url         = "https://meine.hanseaticbank.de",
   services    = {"Hanseatic Bank"},
   description = "Hanseatic Bank credit card (App SCA or SMS OTP)"
@@ -436,9 +445,16 @@ function InitializeSession2(protocol, bankCode, step, credentials, interactive)
     LocalStorage.userId = loginId
     LocalStorage.pw     = password
 
-    -- Fast path: try stored device token (skips SCA push entirely).
-    -- Device token + credentials → bank recognises the device and returns
-    -- an access token directly without triggering an app push or SMS OTP.
+    -- Non-interactive guard: never trigger SCA pushes during background syncs.
+    -- Even the device token POST triggers a push (bank returns id_token, not
+    -- access_token directly), so we must guard before any network request.
+    if not interactive then
+      return LoginFailed
+    end
+
+    -- Device token: bank always requires SCA (returns id_token), but sending
+    -- the stored token tells the bank which device to use. Reuse the SCA
+    -- session from this POST instead of sending a second request.
     local storedToken = LocalStorage.deviceToken
     if storedToken then
       MM.printStatus("Anmeldung mit gespeichertem Geräteschlüssel...")
@@ -454,16 +470,13 @@ function InitializeSession2(protocol, bankCode, step, credentials, interactive)
         local d   = tryJSON(resp)
         local tok = d and d["access_token"]
         if tok then
+          -- Uncommon: bank accepted token without SCA.
           accessToken = tok
           LocalStorage.accessToken = tok
           LocalStorage.pw          = nil
           getCustomerData(tok)
 
-          -- Check if session SCA is needed for full transaction history.
-          -- Only trigger in interactive mode; leave the flag set otherwise
-          -- so the next interactive sync can pick it up.
-          -- Same logic as Phase A — Phase B handles subsequent steps.
-          local doSessionSCA = interactive and LocalStorage.needSessionSCA == "yes"
+          local doSessionSCA = LocalStorage.needSessionSCA == "yes"
           if doSessionSCA then LocalStorage.needSessionSCA = nil end
 
           if doSessionSCA then
@@ -497,15 +510,39 @@ function InitializeSession2(protocol, bankCode, step, credentials, interactive)
           MM.printStatus("Erfolgreich angemeldet.")
           return nil
         end
+
+        -- Bank requires SCA (returned id_token). Reuse this SCA session to
+        -- avoid sending a second POST (which would trigger a second push).
+        local idToken = d and d["id_token"]
+        local payload = idToken and extractJWTPayload(idToken)
+        local scaId   = payload and payload["sca_id"]
+        local scaType = payload and (payload["sca_type"] or "APP")
+
+        if scaId then
+          -- deviceToken is valid; keep it for the final exchange in Phase A.
+          LocalStorage.scaId   = scaId
+          LocalStorage.scaType = scaType
+          LocalStorage.tries   = 0
+          if scaType == "SMS" then
+            return {
+              title     = "SMS-OTP eingeben",
+              challenge = "Ein SMS-OTP wurde an Ihre hinterlegte Mobilnummer gesendet.\n\n"
+                        .. "Bitte OTP eingeben:",
+              label     = "SMS-OTP",
+            }
+          else
+            return {
+              title     = "App-Bestätigung erforderlich",
+              challenge = "Eine Anmeldeanforderung wurde an die Hanseatic Bank App gesendet.\n\n"
+                        .. "Bitte die App öffnen, die Anmeldung bestätigen\n"
+                        .. "und dann auf 'Weiter' klicken."
+            }
+          end
+        end
       end
-      -- Token rejected by bank (e.g. after password change) → full SCA.
+      -- Actual error from bank (e.g. password change): token rejected.
       MM.printStatus("Geräteschlüssel ungültig — vollständige SCA erforderlich...")
       LocalStorage.deviceToken = nil
-    end
-
-    -- Non-interactive guard: do not trigger SCA push during background syncs.
-    if not interactive then
-      return LoginFailed
     end
 
     MM.printStatus("Anmeldung wird gesendet...")
